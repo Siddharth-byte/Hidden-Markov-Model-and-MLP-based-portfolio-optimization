@@ -8,130 +8,132 @@ from sklearn.preprocessing import RobustScaler
 import plotly.express as px
 
 # --- APP CONFIG ---
-st.set_page_config(page_title="Quant-Grade Portfolio AI", layout="wide")
-st.title("⚖️ Professional Regime-Aware Optimizer")
+st.set_page_config(page_title="Portfolio AI Pro", layout="wide")
+st.title("⚖️ Institutional-Grade Portfolio Optimizer")
 
 with st.sidebar:
     st.header("1. Universe & Timeframe")
     ticker_input = st.text_input("Tickers", "AAPL, MSFT, NVDA, JNJ, SPY, TLT, GLD")
-    cash_proxy = st.selectbox("Safe Haven Asset", ["SHV", "BIL", "IEF"])
-    start_date = st.date_input("Start Date", pd.to_datetime("2016-01-01"))
+    cash_proxy = st.selectbox("Safe Haven Asset (Cash)", ["SHV", "BIL", "IEF"])
+    start_date = st.date_input("Start Date", pd.to_datetime("2017-01-01"))
     end_date = st.date_input("End Date", pd.to_datetime("2024-01-01"))
     
-    st.header("2. Risk Controls")
-    turnover_limit = st.slider("Portfolio Smoothing (Low = Less Trading)", 0.05, 0.50, 0.15)
-    run_btn = st.button("🚀 Execute Backtest")
+    st.header("2. Optimization Controls")
+    smoothing = st.slider("Turnover Control (Smoothing)", 0.01, 0.30, 0.10)
+    st.info("Lower values reduce trading costs by preventing sudden weight flips.")
+    run_btn = st.button("🚀 Run Backtest")
 
-# --- UTILITIES ---
-def get_clean_data(tickers, cash, start, end):
+# --- DATA FETCHING ---
+@st.cache_data
+def get_data(tickers, cash, start, end):
     assets = [t.strip().upper() for t in tickers.split(",") if t.strip()]
     df = yf.download(assets + [cash], start=start, end=end)['Close']
-    # Ensure we only use assets present throughout the majority of the period
     valid_assets = df.columns[df.notna().sum() > (len(df) * 0.9)]
     return df[valid_assets].dropna(), [a for a in assets if a in valid_assets]
 
-# --- CORE ENGINE ---
+# --- BACKTEST ENGINE ---
 @st.cache_data
-def run_backtest(tickers, cash_ticker, start, end, smoothing):
-    data, assets = get_clean_data(tickers, cash_ticker, start, end)
+def run_backtest(tickers, cash_ticker, start, end, turn_limit):
+    data, assets = get_data(tickers, cash_ticker, start, end)
     returns = data[assets].pct_change().dropna()
     cash_rets = data[cash_ticker].pct_change().dropna()
     
-    # Pre-calculate features to avoid leakage in the loop
+    # Feature Engineering (Return momentum and volatility)
     m_ret = returns.mean(axis=1).rolling(5).mean()
     m_vol = returns.mean(axis=1).rolling(20).std()
-    features_base = pd.concat([m_ret, m_vol], axis=1).dropna()
+    features = pd.concat([m_ret, m_vol], axis=1).dropna()
     
-    # Setup Walk-Forward (1-year training window, 1-month step)
-    window_size = 252  # 1 Year
-    step_size = 21     # 1 Month
+    window = 252 # 1 Year Training
+    step = 21    # 1 Month Rebalance
+    
     strat_rets = []
-    all_weights = []
+    weight_history = []
+    cur_weights = np.array([1.0/len(assets)] * len(assets))
     
-    current_weights = np.array([1.0/len(assets)] * len(assets))
-    
-    for i in range(window_size, len(features_base) - step_size, step_size):
-        # 1. Training Slice (No Leakage)
-        train_idx = features_base.index[i-window_size : i]
-        test_idx = features_base.index[i : i+step_size]
+    # Walk-Forward Loop
+    for i in range(window, len(features) - step, step):
+        train_idx = features.index[i-window : i]
+        test_idx = features.index[i : i+step]
         
-        X_train = features_base.loc[train_idx].values
-        
-        # 2. HMM Fitting (Local to this window only)
+        # 1. Local HMM (Fixes Regime Leakage)
+        X_train = features.loc[train_idx].values
         scaler = RobustScaler().fit(X_train)
-        X_train_scaled = scaler.transform(X_train)
         hmm = GaussianHMM(n_components=3, covariance_type="diag", random_state=42)
-        hmm.fit(X_train_scaled)
+        hmm.fit(scaler.transform(X_train))
         
-        # 3. MLP Regression (Predicting Forward Returns, not labels)
-        # Target = Mean return over next 5 days
+        # 2. MLP Regression (Fixes Unstable Labels)
         y_train = returns.loc[train_idx].shift(-5).rolling(5).mean().dropna()
-        X_train_mlp = features_base.loc[y_train.index].values
-        
+        X_mlp = features.loc[y_train.index].values
         mlp = MLPRegressor(hidden_layer_sizes=(16, 8), max_iter=1000, random_state=42)
-        mlp.fit(X_train_mlp, y_train.values)
+        mlp.fit(X_mlp, y_train.values)
         
-        # 4. Out-of-Sample Prediction
-        X_test_scaled = scaler.transform(features_base.loc[test_idx].values)
-        regimes = hmm.predict(X_test_scaled)
-        pred_returns = mlp.predict(features_base.loc[test_idx].values)
+        # 3. Predict & Allocate
+        test_feat = features.loc[test_idx].values
+        regimes = hmm.predict(scaler.transform(test_feat))
+        pred_rets = mlp.predict(test_feat)
         
-        # 5. Portfolio Construction (Risk Parity + Conviction)
         for j, date in enumerate(test_idx):
-            # If Bear Regime (detected via local HMM)
-            is_bear = regimes[j] == 0 # Simplified assumption for report
+            # Softmax to get target weights from predicted returns
+            target = np.exp(pred_rets[j]) / np.sum(np.exp(pred_rets[j]))
             
-            # Conviction-based weighting
-            raw_target_weights = np.exp(pred_returns[j]) / np.sum(np.exp(pred_returns[j]))
+            # Regime-aware shift (Regime 0 often maps to high volatility)
+            is_crisis = regimes[j] == 0
+            allocation_to_assets = 0.6 if is_crisis else 1.0
             
-            # Crisis Handling: Shift 40% to Cash if Bear detected
-            if is_bear:
-                target_weights = 0.6 * raw_target_weights
-                cash_allocation = 0.4
-            else:
-                target_weights = raw_target_weights
-                cash_allocation = 0.0
+            # Apply Smoothing (Turnover Control)
+            cur_weights = (1 - turn_limit) * cur_weights + (turn_limit * target)
             
-            # Turnover Control (Smoothing)
-            current_weights = (1 - smoothing) * current_weights + (smoothing * target_weights)
+            # Execute
+            day_ret = (cur_weights * returns.loc[date] * allocation_to_assets).sum() + \
+                      ((1 - allocation_to_assets) * cash_rets.loc[date])
             
-            # Calculate Performance
-            port_ret = (current_weights * returns.loc[date]).sum() + (cash_allocation * cash_rets.loc[date])
-            strat_rets.append(port_ret)
-            all_weights.append(current_weights)
+            strat_rets.append(day_ret)
+            weight_history.append(cur_weights * allocation_to_assets)
 
-    final_idx = features_base.index[window_size : window_size + len(strat_rets)]
-    return pd.Series(strat_rets, index=final_idx), returns.loc[final_idx].mean(axis=1), pd.DataFrame(all_weights, index=final_idx, columns=assets)
+    final_idx = features.index[window : window + len(strat_rets)]
+    return pd.Series(strat_rets, index=final_idx), \
+           returns.loc[final_idx].mean(axis=1), \
+           pd.DataFrame(weight_history, index=final_idx, columns=assets), \
+           (1 + returns.loc[final_idx]).cumprod()
 
-# --- UI LOGIC ---
+# --- DASHBOARD UI ---
 if run_btn:
     try:
-        s_ret, e_ret, w_history = run_backtest(ticker_input, cash_proxy, start_date, end_date, turnover_limit)
+        s_ret, e_ret, weights, asset_ts = run_backtest(ticker_input, cash_proxy, start_date, end_date, smoothing)
         
-        # Performance Table
-        def get_metrics(r):
-            ann = r.mean() * 252
-            vol = r.std() * np.sqrt(252)
-            return ann, vol, ann/vol
-
-        s_metrics = get_metrics(s_ret)
-        e_metrics = get_metrics(e_ret)
+        # 1. KEY METRICS
+        def get_stats(r):
+            return r.mean()*252, r.std()*np.sqrt(252), (r.mean()*252)/(r.std()*np.sqrt(252))
+        
+        s_an, s_v, s_sh = get_stats(s_ret)
+        e_an, e_v, e_sh = get_stats(e_ret)
 
         c1, c2, c3 = st.columns(3)
-        c1.metric("Strategy Sharpe", f"{s_metrics[2]:.2f}", f"{s_metrics[2]-e_metrics[2]:.2f} vs EW")
-        c2.metric("Ann. Return", f"{s_metrics[0]:.1%}")
-        c3.metric("Ann. Volatility", f"{s_metrics[1]:.1%}")
+        c1.metric("Strategy Sharpe", f"{s_sh:.2f}", f"{s_sh-e_sh:.2f} vs EW")
+        c2.metric("Annualized Return", f"{s_an:.1%}")
+        c3.metric("Max Daily Vol", f"{s_ret.std():.2%}")
 
         st.divider()
+
+        # 2. PERFORMANCE CHARTS
+        tab1, tab2, tab3 = st.tabs(["💰 Strategy Performance", "📊 Asset Time-Series", "⚖️ Weight Allocation"])
         
-        # Visuals
-        t1, t2 = st.tabs(["Performance", "Portfolio Composition"])
-        with t1:
-            comp_df = pd.DataFrame({"Strategy": (1+s_ret).cumprod(), "Equal Weight": (1+e_ret).cumprod()})
-            st.line_chart(comp_df)
-        with t2:
-            st.subheader("Weight Evolution (Turnover Controlled)")
-            st.area_chart(w_history)
+        with tab1:
+            st.subheader("Cumulative Strategy Returns")
+            main_df = pd.DataFrame({"AI Strategy": (1+s_ret).cumprod(), "Equal Weight": (1+e_ret).cumprod()})
+            st.line_chart(main_df)
+
+        with tab2:
+            st.subheader("Individual Asset Performance (Test Period)")
+            st.plotly_chart(px.line(asset_ts, labels={"value": "Growth", "index": "Date"}), use_container_width=True)
+
+        with tab3:
+            st.subheader("Evolution of Portfolio Weights")
+            st.info("The smooth transitions below demonstrate effective Turnover Control.")
+            st.area_chart(weights)
             
+            st.subheader("Current Portfolio Snapshot")
+            st.bar_chart(weights.iloc[-1])
+
     except Exception as e:
-        st.error(f"Backtest Error: {e}")
+        st.error(f"Error during analysis: {e}")
