@@ -18,7 +18,10 @@ with st.sidebar:
     st.header("Strategy Settings")
     ticker_input = st.text_input("Tickers", "AAPL, MSFT, NVDA, JNJ, SPY, TLT, GLD, QQQ")
     cash_proxy = st.selectbox("Cash Proxy (Defensive)", ["SHV", "BIL", "IEF"])
-    # Date selection added back for user control
+    
+    # Re-adding the HMM Slider
+    n_regimes = st.slider("Number of Market Regimes", 2, 5, 3)
+    
     start_date = st.date_input("Start Date", pd.to_datetime("2015-01-01"))
     end_date = st.date_input("End Date", pd.to_datetime("2024-01-01"))
     run_btn = st.button("Run Improved Optimization")
@@ -29,43 +32,53 @@ def add_indicators(df):
     change = returns.mean(axis=1)
     gain = (change.where(change > 0, 0)).rolling(window=14).mean()
     loss = (-change.where(change < 0, 0)).rolling(window=14).mean()
-    rs = gain / loss
+    rs = gain / (loss + 1e-9) # Added epsilon to prevent div by zero
     rsi = 100 - (100 / (1 + rs))
     sma200 = df.mean(axis=1).rolling(200).mean()
-    dist_sma = (df.mean(axis=1) / sma200) - 1
+    dist_sma = (df.mean(axis=1) / (sma200 + 1e-9)) - 1
     return rsi, dist_sma
 
 # --- CORE STRATEGY ---
 @st.cache_data
-def run_improved_strategy(tickers, cash_ticker, start, end):
+def run_improved_strategy(tickers, cash_ticker, start, end, n_states):
     assets = [t.strip().upper() for t in tickers.split(",")]
     all_tickers = assets + [cash_ticker]
-    data = yf.download(all_tickers, start=start, end=end)['Close'].dropna()
+    data = yf.download(all_tickers, start=start, end=end)['Adj Close'].dropna()
     
     returns = data[assets].pct_change().dropna()
     cash_returns = data[cash_ticker].pct_change().dropna()
     
-    # 1. HMM with Return + Volatility Features
-    m_ret = returns.mean(axis=1).rolling(5).mean().dropna()
-    m_vol = returns.mean(axis=1).rolling(20).std().dropna()
-    hmm_input = np.column_stack([m_ret, m_vol])
+    # 1. HMM Input Alignment FIX
+    m_ret = returns.mean(axis=1).rolling(5).mean()
+    m_vol = returns.mean(axis=1).rolling(20).std()
+    
+    # The fix: Aligning by dropping all NaNs across both series
+    hmm_features = pd.concat([m_ret, m_vol], axis=1).dropna()
+    hmm_features.columns = ['ret', 'vol']
     
     scaler_hmm = RobustScaler() 
-    hmm_input_scaled = scaler_hmm.fit_transform(hmm_input)
+    hmm_input_scaled = scaler_hmm.fit_transform(hmm_features.values)
     
-    hmm = GaussianHMM(n_components=3, covariance_type="diag", n_iter=1000, random_state=42)
+    hmm = GaussianHMM(n_components=n_states, covariance_type="diag", n_iter=1000, random_state=42)
     hmm.fit(hmm_input_scaled)
     regime_probs = hmm.predict_proba(hmm_input_scaled)
     
-    # 2. Feature Engineering
+    # 2. Advanced Feature Engineering Alignment
     rsi, dist_sma = add_indicators(data[assets])
-    features = pd.DataFrame(regime_probs, index=m_ret.index, columns=['P_Bear', 'P_Side', 'P_Bull'])
-    features['RSI'] = rsi.reindex(features.index)
-    features['SMA_Dist'] = dist_sma.reindex(features.index)
+    
+    # Create a feature dataframe and align everything to the same index
+    features = pd.DataFrame(regime_probs, index=hmm_features.index, columns=[f'P_Regime_{i}' for i in range(n_states)])
+    features['RSI'] = rsi
+    features['SMA_Dist'] = dist_sma
     features = features.dropna()
     
-    y = returns.reindex(features.index).shift(-5).rolling(5).mean().idxmax(axis=1).dropna()
-    X = features.loc[y.index]
+    # Target Alignment
+    # We find the winning asset over the next 5 days
+    y_raw = returns.shift(-5).rolling(5).mean().idxmax(axis=1)
+    common_index = features.index.intersection(y_raw.dropna().index)
+    
+    X = features.loc[common_index]
+    y = y_raw.loc[common_index]
     
     # 3. Walk-Forward Logic
     tscv = TimeSeriesSplit(n_splits=5)
@@ -80,7 +93,9 @@ def run_improved_strategy(tickers, cash_ticker, start, end):
         
         probs = mlp.predict_proba(X_test)
         weights_df = pd.DataFrame(probs, columns=mlp.classes_, index=X_test.index).reindex(columns=assets, fill_value=0)
-        bear_filter = X_test['P_Bear'] > 0.4
+        
+        # Risk Switch: If the first regime probability (usually the high-vol one) is > 40%
+        bear_filter = X_test.iloc[:, 0] > 0.4
         
         test_returns = returns.loc[X_test.index]
         test_cash = cash_returns.loc[X_test.index]
@@ -93,7 +108,6 @@ def run_improved_strategy(tickers, cash_ticker, start, end):
                 daily_perf = (w * r).sum()
             strat_rets.append(daily_perf)
 
-    # Asset-wise cumulative returns for the test period
     test_period_index = X.index[-len(strat_rets):]
     individual_cum_rets = (1 + returns.loc[test_period_index]).cumprod()
 
@@ -104,11 +118,11 @@ def run_improved_strategy(tickers, cash_ticker, start, end):
 
 # --- UI EXECUTION ---
 if run_btn:
-    with st.spinner("Analyzing Market States..."):
+    with st.spinner("Aligning Data and Running Optimization..."):
         try:
-            strat, ew, last_w, asset_cum_rets = run_improved_strategy(ticker_input, cash_proxy, start_date, end_date)
+            strat, ew, last_w, asset_cum_rets = run_improved_strategy(ticker_input, cash_proxy, start_date, end_date, n_regimes)
             
-            # --- METRICS ---
+            # Statistics
             def stats(r):
                 return r.mean()*252, r.std()*np.sqrt(252), (r.mean()*252)/(r.std()*np.sqrt(252))
             
@@ -122,17 +136,13 @@ if run_btn:
             
             st.divider()
 
-            # --- CHARTS ---
             col_a, col_b = st.columns(2)
-            
             with col_a:
                 st.subheader("Strategy vs. Benchmark")
                 perf_comp = pd.DataFrame({"AI Strategy": (1+strat).cumprod(), "Equal Weight": (1+ew).cumprod()})
                 st.line_chart(perf_comp)
-
             with col_b:
                 st.subheader("Individual Asset Returns")
-                # Using Plotly for better color distinction in multi-line charts
                 fig_assets = px.line(asset_cum_rets, labels={"value": "Cumulative Return", "index": "Date"})
                 st.plotly_chart(fig_assets, use_container_width=True)
 
