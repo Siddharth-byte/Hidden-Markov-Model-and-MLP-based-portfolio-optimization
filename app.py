@@ -18,10 +18,10 @@ with st.sidebar:
     st.header("Strategy Settings")
     ticker_input = st.text_input("Tickers", "AAPL, MSFT, NVDA, JNJ, SPY, TLT, GLD, QQQ")
     cash_proxy = st.selectbox("Cash Proxy (Defensive)", ["SHV", "BIL", "IEF"])
-    
-    # Re-adding the HMM Slider
     n_regimes = st.slider("Number of Market Regimes", 2, 5, 3)
     
+    st.subheader("Timeframe")
+    st.info("Note: Use at least 1 year of data for the 200-day indicators to work.")
     start_date = st.date_input("Start Date", pd.to_datetime("2015-01-01"))
     end_date = st.date_input("End Date", pd.to_datetime("2024-01-01"))
     run_btn = st.button("Run Improved Optimization")
@@ -32,10 +32,17 @@ def add_indicators(df):
     change = returns.mean(axis=1)
     gain = (change.where(change > 0, 0)).rolling(window=14).mean()
     loss = (-change.where(change < 0, 0)).rolling(window=14).mean()
-    rs = gain / (loss + 1e-9) # Added epsilon to prevent div by zero
+    rs = gain / (loss + 1e-9)
     rsi = 100 - (100 / (1 + rs))
-    sma200 = df.mean(axis=1).rolling(200).mean()
-    dist_sma = (df.mean(axis=1) / (sma200 + 1e-9)) - 1
+    
+    # Check if we have enough data for 200-day SMA
+    if len(df) > 200:
+        sma_window = 200
+    else:
+        sma_window = len(df) // 2 # Fallback to half the data length
+        
+    sma = df.mean(axis=1).rolling(window=sma_window).mean()
+    dist_sma = (df.mean(axis=1) / (sma + 1e-9)) - 1
     return rsi, dist_sma
 
 # --- CORE STRATEGY ---
@@ -43,18 +50,28 @@ def add_indicators(df):
 def run_improved_strategy(tickers, cash_ticker, start, end, n_states):
     assets = [t.strip().upper() for t in tickers.split(",")]
     all_tickers = assets + [cash_ticker]
-    data = yf.download(all_tickers, start=start, end=end)['Close'].dropna()
     
-    returns = data[assets].pct_change().dropna()
+    # 1. Robust Data Fetching
+    raw_data = yf.download(all_tickers, start=start, end=end)['Close']
+    
+    if raw_data.empty:
+        raise ValueError("No data found for these tickers/dates.")
+    
+    # Drop columns that are entirely NaN, then drop rows with any NaN
+    data = raw_data.dropna(axis=1, how='all').dropna()
+    
+    if len(data) < 50:
+        raise ValueError(f"Insufficient data points ({len(data)}). Increase your date range.")
+
+    # Re-identify available assets after cleaning
+    available_assets = [a for a in assets if a in data.columns]
+    returns = data[available_assets].pct_change().dropna()
     cash_returns = data[cash_ticker].pct_change().dropna()
     
-    # 1. HMM Input Alignment FIX
+    # 2. HMM Logic
     m_ret = returns.mean(axis=1).rolling(5).mean()
     m_vol = returns.mean(axis=1).rolling(20).std()
-    
-    # The fix: Aligning by dropping all NaNs across both series
     hmm_features = pd.concat([m_ret, m_vol], axis=1).dropna()
-    hmm_features.columns = ['ret', 'vol']
     
     scaler_hmm = RobustScaler() 
     hmm_input_scaled = scaler_hmm.fit_transform(hmm_features.values)
@@ -63,38 +80,38 @@ def run_improved_strategy(tickers, cash_ticker, start, end, n_states):
     hmm.fit(hmm_input_scaled)
     regime_probs = hmm.predict_proba(hmm_input_scaled)
     
-    # 2. Advanced Feature Engineering Alignment
-    rsi, dist_sma = add_indicators(data[assets])
-    
-    # Create a feature dataframe and align everything to the same index
+    # 3. Indicators & Alignment
+    rsi, dist_sma = add_indicators(data[available_assets])
     features = pd.DataFrame(regime_probs, index=hmm_features.index, columns=[f'P_Regime_{i}' for i in range(n_states)])
     features['RSI'] = rsi
     features['SMA_Dist'] = dist_sma
     features = features.dropna()
     
-    # Target Alignment
-    # We find the winning asset over the next 5 days
+    # Shift forward to predict the "Winner" of the next week
     y_raw = returns.shift(-5).rolling(5).mean().idxmax(axis=1)
     common_index = features.index.intersection(y_raw.dropna().index)
     
+    if len(common_index) < 20:
+        raise ValueError("Not enough overlapping data for training. Try a longer date range.")
+        
     X = features.loc[common_index]
     y = y_raw.loc[common_index]
     
-    # 3. Walk-Forward Logic
-    tscv = TimeSeriesSplit(n_splits=5)
+    # 4. Walk-Forward
+    tscv = TimeSeriesSplit(n_splits=3 if len(X) < 500 else 5)
     strat_rets = []
     
     for train_ix, test_ix in tscv.split(X):
         X_train, X_test = X.iloc[train_ix], X.iloc[test_ix]
         y_train = y.iloc[train_ix]
         
-        mlp = MLPClassifier(hidden_layer_sizes=(32, 16), alpha=0.1, max_iter=2000, random_state=42)
+        mlp = MLPClassifier(hidden_layer_sizes=(16, 8), alpha=0.5, max_iter=1000, random_state=42)
         mlp.fit(X_train, y_train)
         
         probs = mlp.predict_proba(X_test)
-        weights_df = pd.DataFrame(probs, columns=mlp.classes_, index=X_test.index).reindex(columns=assets, fill_value=0)
+        weights_df = pd.DataFrame(probs, columns=mlp.classes_, index=X_test.index).reindex(columns=available_assets, fill_value=0)
         
-        # Risk Switch: If the first regime probability (usually the high-vol one) is > 40%
+        # Risk Switch (Regime 0 is typically the high-vol/low-return state)
         bear_filter = X_test.iloc[:, 0] > 0.4
         
         test_returns = returns.loc[X_test.index]
@@ -102,52 +119,46 @@ def run_improved_strategy(tickers, cash_ticker, start, end, n_states):
         
         for date in X_test.index:
             w, r, c = weights_df.loc[date].values, test_returns.loc[date].values, test_cash.loc[date]
-            if bear_filter.loc[date]:
-                daily_perf = (0.5 * (w * r).sum()) + (0.5 * c)
-            else:
-                daily_perf = (w * r).sum()
-            strat_rets.append(daily_perf)
+            strat_rets.append((0.5 * (w * r).sum() + 0.5 * c) if bear_filter.loc[date] else (w * r).sum())
 
-    test_period_index = X.index[-len(strat_rets):]
-    individual_cum_rets = (1 + returns.loc[test_period_index]).cumprod()
-
-    return (pd.Series(strat_rets, index=test_period_index), 
-            returns.loc[test_period_index].mean(axis=1), 
+    test_idx = X.index[-len(strat_rets):]
+    return (pd.Series(strat_rets, index=test_idx), 
+            returns.loc[test_idx].mean(axis=1), 
             weights_df.iloc[-1], 
-            individual_cum_rets)
+            (1 + returns.loc[test_idx]).cumprod())
 
 # --- UI EXECUTION ---
 if run_btn:
-    with st.spinner("Aligning Data and Running Optimization..."):
+    with st.spinner("Crunching data..."):
         try:
             strat, ew, last_w, asset_cum_rets = run_improved_strategy(ticker_input, cash_proxy, start_date, end_date, n_regimes)
             
-            # Statistics
-            def stats(r):
-                return r.mean()*252, r.std()*np.sqrt(252), (r.mean()*252)/(r.std()*np.sqrt(252))
+            # Summary Metrics
+            s_ret = strat.mean() * 252
+            s_vol = strat.std() * np.sqrt(252)
+            s_sharpe = s_ret / s_vol if s_vol != 0 else 0
             
-            s_ret, s_vol, s_sh = stats(strat)
-            e_ret, e_vol, e_sh = stats(ew)
+            e_ret = ew.mean() * 252
+            e_vol = ew.std() * np.sqrt(252)
+            e_sharpe = e_ret / e_vol if e_vol != 0 else 0
             
-            c1, c2, c3 = st.columns(3)
-            c1.metric("Strategy Sharpe", f"{s_sh:.2f}", f"{s_sh - e_sh:.2f} vs EW")
-            c2.metric("Annualized Volatility", f"{s_vol:.2%}")
-            c3.metric("Annualized Return", f"{s_ret:.2%}")
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Strategy Sharpe", f"{s_sharpe:.2f}", f"{s_sharpe - e_sharpe:.2f}")
+            m2.metric("Annual Volatility", f"{s_vol:.2%}")
+            m3.metric("Annual Return", f"{s_ret:.2%}")
             
             st.divider()
-
-            col_a, col_b = st.columns(2)
-            with col_a:
-                st.subheader("Strategy vs. Benchmark")
-                perf_comp = pd.DataFrame({"AI Strategy": (1+strat).cumprod(), "Equal Weight": (1+ew).cumprod()})
-                st.line_chart(perf_comp)
-            with col_b:
-                st.subheader("Individual Asset Returns")
-                fig_assets = px.line(asset_cum_rets, labels={"value": "Cumulative Return", "index": "Date"})
-                st.plotly_chart(fig_assets, use_container_width=True)
-
-            st.subheader("Current Regime-Based Weights")
+            
+            c_left, c_right = st.columns(2)
+            with c_left:
+                st.subheader("Cumulative Growth")
+                st.line_chart(pd.DataFrame({"Strategy": (1+strat).cumprod(), "Benchmark": (1+ew).cumprod()}))
+            with c_right:
+                st.subheader("Asset Performance")
+                st.plotly_chart(px.line(asset_cum_rets), use_container_width=True)
+                
+            st.subheader("Current Weights")
             st.bar_chart(last_w)
             
         except Exception as e:
-            st.error(f"Error encountered: {e}")
+            st.error(f"Error: {e}")
