@@ -40,7 +40,7 @@ def add_indicators(df):
 def run_improved_strategy(tickers, cash_ticker, start, end):
     assets = [t.strip().upper() for t in tickers.split(",")]
     all_tickers = assets + [cash_ticker]
-    data = yf.download(all_tickers, start=start, end=end)['Adj Close'].dropna()
+    data = yf.download(all_tickers, start=start, end=end)['Close'].dropna()
     
     returns = data[assets].pct_change().dropna()
     cash_returns = data[cash_ticker].pct_change().dropna()
