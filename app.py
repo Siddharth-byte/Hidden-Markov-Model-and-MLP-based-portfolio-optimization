@@ -9,7 +9,7 @@ import plotly.express as px
 
 # --- APP CONFIG ---
 st.set_page_config(page_title="Portfolio AI Pro", layout="wide")
-st.title("⚖️ Institutional-Grade Portfolio Optimizer")
+st.title("MLP and HMM based Portfolio Optimizer")
 
 with st.sidebar:
     st.header("1. Universe & Timeframe")
@@ -20,8 +20,8 @@ with st.sidebar:
     end_date = st.date_input("End Date", pd.to_datetime("2024-01-01"))
     
     st.header("2. Optimization Controls")
-    smoothing = st.slider("Turnover Control (Smoothing)", 0.01, 0.30, 0.10)
-    run_btn = st.button("🚀 Run Backtest")
+    smoothing = st.slider("Turnover Control (Smoothing)", 0.01, 0.50, 0.10)
+    run_btn = st.button("Run Backtest")
 
 # --- UTILITY FUNCTIONS ---
 def calculate_mdd(returns):
@@ -145,7 +145,7 @@ if run_btn:
 
         st.divider()
 
-        tab1, tab2, tab3 = st.tabs(["💰 Performance", "📊 Asset Time-Series", "📋 Asset Weights"])
+        tab1, tab2, tab3 = st.tabs(["Performance", "Asset Time-Series", "Asset Weights"])
         
         with tab1:
             st.subheader("Comparison: Strategy vs Benchmark vs S&P 500")
