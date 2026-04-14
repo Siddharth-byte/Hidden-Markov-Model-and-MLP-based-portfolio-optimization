@@ -9,7 +9,7 @@ import plotly.express as px
 
 # --- APP CONFIG ---
 st.set_page_config(page_title="Portfolio AI Pro", layout="wide")
-st.title("⚖️ Institutional-Grade Portfolio Optimizer")
+st.title("MLP based Portfolio Optimizer")
 
 with st.sidebar:
     st.header("1. Universe & Timeframe")
@@ -22,7 +22,7 @@ with st.sidebar:
     
     st.header("2. Optimization Controls")
     smoothing = st.slider("Turnover Control (Smoothing)", 0.01, 0.30, 0.10)
-    run_btn = st.button("🚀 Run Backtest")
+    run_btn = st.button("Run Backtest")
 
 # --- DATA FETCHING ---
 @st.cache_data
@@ -124,7 +124,7 @@ if run_btn:
 
         st.divider()
 
-        tab1, tab2, tab3 = st.tabs(["💰 Performance", "📊 Asset Time-Series", "📋 Asset Weights"])
+        tab1, tab2, tab3 = st.tabs(["Performance", "Asset Time-Series", "Asset Weights"])
         
         with tab1:
             st.subheader("Strategy Cumulative Growth")
