@@ -67,16 +67,17 @@ def get_data(tickers, cash, start, end):
 def run_backtest(tickers, cash_ticker, start, end, turn_limit):
     data, assets, sp500_all = get_data(tickers, cash_ticker, start, end)
 
+    if data.empty or len(assets) == 0:
+        raise ValueError("No valid data available")
+
     returns = data[assets].pct_change().dropna()
     cash_rets = data[cash_ticker].pct_change().dropna()
 
-    # --- FEATURES ---
+    # Features
     m_ret = returns.mean(axis=1).rolling(5).mean()
     m_vol = returns.mean(axis=1).rolling(20).std()
-    downside = returns.clip(upper=0).rolling(20).std()
-    trend = returns.mean(axis=1).rolling(50).mean()
-
-    features = pd.concat([m_ret, m_vol, downside], axis=1).dropna()
+    features = pd.concat([m_ret, m_vol], axis=1).dropna()
+    features.columns = ['Mean_Ret', 'Vol']
 
     total_len = len(features)
     window = min(252, int(total_len * 0.4))
@@ -89,60 +90,66 @@ def run_backtest(tickers, cash_ticker, start, end, turn_limit):
         train_idx = features.index[max(0, i-window):i]
         test_idx = features.index[i:min(i + step, total_len)]
 
+        if len(train_idx) < 20:
+            continue
+
         # --- HMM ---
-        scaler = RobustScaler().fit(features.loc[train_idx])
-        X_train = scaler.transform(features.loc[train_idx])
+        X_train_df = features.loc[train_idx].dropna()
+        if len(X_train_df) < 20:
+            continue
+
+        scaler = RobustScaler().fit(X_train_df.values)
+        X_train = scaler.transform(X_train_df.values)
 
         hmm = GaussianHMM(n_components=3, random_state=42)
         hmm.fit(X_train)
 
-        # Proper crisis detection: lowest return state
-        state_means = hmm.means_[:, 0]
-        crisis_state = np.argmin(state_means)
+        # Detect crisis regime (highest variance)
+        covars = hmm.covars_
+        if covars.ndim == 3:
+            vol_measure = [np.trace(c) for c in covars]
+        else:
+            vol_measure = covars
 
+        crisis_state = np.argmax(vol_measure)
         log_likelihood = hmm.score(X_train)
 
-        # --- MLP (per-asset prediction) ---
-        y_train = returns.loc[train_idx].shift(-1).dropna()
+        # --- MLP ---
+        y_train = returns.loc[train_idx].shift(-1).mean(axis=1).dropna()
         X_mlp = features.loc[y_train.index]
 
+        if len(X_mlp) < 20:
+            continue
+
         mlp = MLPRegressor(hidden_layer_sizes=(16, 8), max_iter=1000, random_state=42)
-        mlp.fit(X_mlp, y_train.values)
+        mlp.fit(X_mlp.values, y_train.values)
 
         # --- TEST ---
-        test_feat = features.loc[test_idx]
-        regimes = hmm.predict(scaler.transform(test_feat))
-        pred_rets = mlp.predict(test_feat)
+        test_feat = features.loc[test_idx].dropna()
+        if len(test_feat) == 0:
+            continue
 
-        # Diagnostics
-        actual_test_rets = returns.loc[test_idx].mean(axis=1).values
-        pred_mean = pred_rets.mean(axis=1)
+        test_array = test_feat.values
+        regimes = hmm.predict(scaler.transform(test_array))
+        pred_rets = mlp.predict(test_array)
 
-        mse = mean_squared_error(actual_test_rets, pred_mean)
-        r2 = r2_score(actual_test_rets, pred_mean) if len(actual_test_rets) > 1 else 0
-        dir_acc = np.mean(np.sign(actual_test_rets) == np.sign(pred_mean))
+        actual_test_rets = returns.loc[test_feat.index].mean(axis=1).values
+        mse = mean_squared_error(actual_test_rets, pred_rets)
+        r2 = r2_score(actual_test_rets, pred_rets) if len(actual_test_rets) > 1 else 0
+        dir_acc = np.mean(np.sign(actual_test_rets) == np.sign(pred_rets))
 
-        for j, date in enumerate(test_idx):
-            pred = pred_rets[j]
+        for j, date in enumerate(test_feat.index):
+            pred_scalar = pred_rets[j]
 
-            # Penalize negative predictions
-            pred = np.where(pred < 0, pred * 2, pred)
+            # Convert scalar → portfolio weights
+            target = np.ones(len(assets)) * (1 + pred_scalar)
+            target = target / target.sum()
 
-            # Softmax allocation
-            target = np.exp(pred) / np.sum(np.exp(pred))
-
-            # Regime-based allocation
             is_crisis = regimes[j] == crisis_state
-            allocation = 0.3 if is_crisis else 1.0
+            allocation = 0.4 if is_crisis else 1.0
 
-            # Trend filter
-            if trend.loc[date] < 0:
-                allocation *= 0.5
-
-            # Smooth weights
             cur_weights = (1 - turn_limit) * cur_weights + (turn_limit * target)
 
-            # Daily return
             day_ret = (cur_weights * returns.loc[date] * allocation).sum() + \
                       ((1 - allocation) * cash_rets.loc[date])
 
@@ -182,10 +189,10 @@ if run:
     s_m = calculate_metrics(s_ret, weights)
 
     c1, c2, c3, c4 = st.columns(4)
-    c1.markdown(f"### CAGR\n{s_m['CAGR']:.2%}")
-    c2.markdown(f"### Sharpe\n{s_m['Sharpe']:.2f}")
-    c3.markdown(f"### Sortino\n{s_m['Sortino']:.2f}")
-    c4.markdown(f"### Max DD\n{s_m['Max DD']:.2%}")
+    c1.markdown(f"### CAGR\n## {s_m['CAGR']:.2%}")
+    c2.markdown(f"### Sharpe\n## {s_m['Sharpe']:.2f}")
+    c3.markdown(f"### Sortino\n## {s_m['Sortino']:.2f}")
+    c4.markdown(f"### Max DD\n## {s_m['Max DD']:.2%}")
 
     st.divider()
 
@@ -204,6 +211,7 @@ if run:
         col1, col2 = st.columns(2)
         col1.metric("Avg MSE", f"{ml_diag['MSE'].mean():.6f}")
         col2.metric("Directional Accuracy", f"{ml_diag['Dir_Accuracy'].mean():.2%}")
+
         st.line_chart(ml_diag[["Log_Likelihood", "R2"]])
 
     with tab3:
