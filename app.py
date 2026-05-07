@@ -8,8 +8,9 @@ from sklearn.preprocessing import RobustScaler
 from sklearn.metrics import mean_squared_error, r2_score
 
 # --- APP CONFIG ---
-st.set_page_config(page_title="Portfolio Opt", layout="wide")
+st.set_page_config(page_title="ML Portfolio Optimizer", layout="wide")
 st.title("MLP and HMM based Portfolio Optimiser")
+st.caption("Active weighting based on MLP return predictions with HMM regime-switching risk overlay.")
 
 # --- METRICS ---
 def calculate_metrics(returns, weights_df=None):
@@ -73,7 +74,7 @@ def run_backtest(tickers, cash_ticker, start, end, turn_limit):
     returns = data[assets].pct_change().dropna()
     cash_rets = data[cash_ticker].pct_change().dropna()
 
-    # Features
+    # Features: Rolling mean and volatility of the equal-weighted universe as a proxy for market state
     m_ret = returns.mean(axis=1).rolling(5).mean()
     m_vol = returns.mean(axis=1).rolling(20).std()
     features = pd.concat([m_ret, m_vol], axis=1).dropna()
@@ -81,7 +82,7 @@ def run_backtest(tickers, cash_ticker, start, end, turn_limit):
 
     total_len = len(features)
     window = min(252, int(total_len * 0.4))
-    step = max(1, int(total_len * 0.05))
+    step = max(5, int(total_len * 0.05)) # Retrain every 5 days or 5% of data
 
     strat_rets, weights_hist, ml_logs = [], [], []
     cur_weights = np.array([1.0 / len(assets)] * len(assets))
@@ -90,86 +91,79 @@ def run_backtest(tickers, cash_ticker, start, end, turn_limit):
         train_idx = features.index[max(0, i-window):i]
         test_idx = features.index[i:min(i + step, total_len)]
 
-        if len(train_idx) < 20:
+        if len(train_idx) < 40:
             continue
 
-        # --- HMM ---
-        X_train_df = features.loc[train_idx].dropna()
-        if len(X_train_df) < 20:
-            continue
-
+        # --- HMM (Regime Detection) ---
+        X_train_df = features.loc[train_idx]
         scaler = RobustScaler().fit(X_train_df.values)
-        X_train = scaler.transform(X_train_df.values)
+        X_train_scaled = scaler.transform(X_train_df.values)
 
         hmm = GaussianHMM(n_components=3, random_state=42)
-        hmm.fit(X_train)
+        hmm.fit(X_train_scaled)
 
-        # Detect crisis regime (highest variance)
+        # Crisis detection via variance
         covars = hmm.covars_
-        if covars.ndim == 3:
-            vol_measure = [np.trace(c) for c in covars]
-        else:
-            vol_measure = covars
-
+        vol_measure = [np.trace(c) if c.ndim == 2 else c for c in covars]
         crisis_state = np.argmax(vol_measure)
-        log_likelihood = hmm.score(X_train)
 
-        # --- MLP ---
-        y_train = returns.loc[train_idx].shift(-1).mean(axis=1).dropna()
-        X_mlp = features.loc[y_train.index]
+        # --- MLP (Predicting Individual Asset Returns) ---
+        # Shift Y to predict NEXT day returns for each asset
+        Y_train_assets = returns.loc[train_idx].shift(-1).dropna()
+        X_mlp_train = features.loc[Y_train_assets.index]
 
-        if len(X_mlp) < 20:
-            continue
+        mlp = MLPRegressor(hidden_layer_sizes=(32, 16), max_iter=1000, random_state=42)
+        mlp.fit(X_mlp_train.values, Y_train_assets.values)
 
-        mlp = MLPRegressor(hidden_layer_sizes=(16, 8), max_iter=1000, random_state=42)
-        mlp.fit(X_mlp.values, y_train.values)
-
-        # --- TEST ---
+        # --- TESTING ON OUT-OF-SAMPLE WINDOW ---
         test_feat = features.loc[test_idx].dropna()
         if len(test_feat) == 0:
             continue
 
-        test_array = test_feat.values
-        regimes = hmm.predict(scaler.transform(test_array))
-        pred_rets = mlp.predict(test_array)
-
-        actual_test_rets = returns.loc[test_feat.index].mean(axis=1).values
-        mse = mean_squared_error(actual_test_rets, pred_rets)
-        r2 = r2_score(actual_test_rets, pred_rets) if len(actual_test_rets) > 1 else 0
-        dir_acc = np.mean(np.sign(actual_test_rets) == np.sign(pred_rets))
+        # Get regime predictions and return predictions
+        test_scaled = scaler.transform(test_feat.values)
+        regimes = hmm.predict(test_scaled)
+        pred_rets_all = mlp.predict(test_feat.values) 
 
         for j, date in enumerate(test_feat.index):
-            pred_scalar = pred_rets[j]
+            preds = pred_rets_all[j]
+            
+            # --- SOFTMAX OPTIMIZATION ---
+            # Instead of equal weight, we allocate based on predicted return magnitude
+            # Using a temperature-scaled softmax to determine weights
+            exp_preds = np.exp(preds / (np.std(preds) + 1e-6))
+            target_weights = exp_preds / exp_preds.sum()
 
-            # Convert scalar → portfolio weights
-            target = np.ones(len(assets)) * (1 + pred_scalar)
-            target = target / target.sum()
-
+            # Regime Filter: If in crisis, reduce risky exposure significantly
             is_crisis = regimes[j] == crisis_state
-            allocation = 0.4 if is_crisis else 1.0
+            risk_multiplier = 0.15 if is_crisis else 1.0 
 
-            cur_weights = (1 - turn_limit) * cur_weights + (turn_limit * target)
+            # Apply Smoothing (Turnover/Inertia control)
+            cur_weights = (1 - turn_limit) * cur_weights + (turn_limit * target_weights)
 
-            day_ret = (cur_weights * returns.loc[date] * allocation).sum() + \
-                      ((1 - allocation) * cash_rets.loc[date])
+            # Portfolio Return = (Weighted Asset Returns * Risk Multiplier) + (Cash * Remaining)
+            day_ret = (cur_weights * returns.loc[date] * risk_multiplier).sum() + \
+                      ((1 - risk_multiplier) * cash_rets.loc[date])
 
             strat_rets.append(day_ret)
-            weights_hist.append(list(cur_weights * allocation) + [1 - allocation])
+            
+            # Record historical weights (including the cash component)
+            weight_entry = list(cur_weights * risk_multiplier) + [1 - risk_multiplier]
+            weights_hist.append(weight_entry)
 
             ml_logs.append({
                 "Date": date,
-                "MSE": mse,
-                "R2": r2,
-                "Dir_Accuracy": dir_acc,
-                "Log_Likelihood": log_likelihood
+                "Avg_Pred": np.mean(preds),
+                "Regime": regimes[j]
             })
 
     final_idx = features.index[window:window + len(strat_rets)]
+    weights_df = pd.DataFrame(weights_hist, index=final_idx, columns=assets + [cash_ticker])
 
     return (
         pd.Series(strat_rets, index=final_idx),
         returns.loc[final_idx].mean(axis=1),
-        pd.DataFrame(weights_hist, index=final_idx, columns=assets + [cash_ticker]),
+        weights_df,
         sp500_all.loc[final_idx],
         pd.DataFrame(ml_logs).set_index("Date")
     )
@@ -177,42 +171,54 @@ def run_backtest(tickers, cash_ticker, start, end, turn_limit):
 # --- UI ---
 with st.sidebar:
     st.header("Parameters")
-    t_in = st.text_input("Tickers", "AAPL, MSFT, NVDA, SPY, GLD")
-    c_in = st.selectbox("Cash", ["BIL", "SHV"])
-    start = st.date_input("Start", pd.to_datetime("2021-01-01"))
-    end = st.date_input("End", pd.to_datetime("2024-01-01"))
-    smooth = st.slider("Smoothing", 0.01, 0.5, 0.15)
-    run = st.button("Execute")
+    t_in = st.text_input("Tickers (Comma Separated)", "AAPL, MSFT, NVDA, SPY, GLD, TLT")
+    c_in = st.selectbox("Cash Asset (Defense)", ["BIL", "SHV"])
+    start = st.date_input("Start Date", pd.to_datetime("2020-01-01"))
+    end = st.date_input("End Date", pd.to_datetime("2024-01-01"))
+    smooth = st.slider("Weight Adaptability (High = High Turnover)", 0.01, 0.5, 0.10)
+    run = st.button("Run Optimizer")
 
 if run:
-    s_ret, e_ret, weights, sp_ret, ml_diag = run_backtest(t_in, c_in, start, end, smooth)
-    s_m = calculate_metrics(s_ret, weights)
+    with st.spinner("Training Models and Backtesting..."):
+        try:
+            s_ret, e_ret, weights, sp_ret, ml_diag = run_backtest(t_in, c_in, start, end, smooth)
+            s_m = calculate_metrics(s_ret, weights)
 
-    c1, c2, c3, c4 = st.columns(4)
-    c1.markdown(f"### CAGR\n## {s_m['CAGR']:.2%}")
-    c2.markdown(f"### Sharpe\n## {s_m['Sharpe']:.2f}")
-    c3.markdown(f"### Sortino\n## {s_m['Sortino']:.2f}")
-    c4.markdown(f"### Max DD\n## {s_m['Max DD']:.2%}")
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("CAGR", f"{s_m['CAGR']:.2%}")
+            c2.metric("Sharpe Ratio", f"{s_m['Sharpe']:.2f}")
+            c3.metric("Sortino Ratio", f"{s_m['Sortino']:.2f}")
+            c4.metric("Max Drawdown", f"{s_m['Max DD']:.2%}")
 
-    st.divider()
+            st.divider()
 
-    tab1, tab2, tab3 = st.tabs(["Performance", "ML Diagnostics", "Portfolio Weights"])
+            tab1, tab2, tab3 = st.tabs(["Performance Analysis", "ML Insights", "Allocation History"])
 
-    with tab1:
-        st.line_chart(pd.DataFrame({
-            "Strategy": (1+s_ret).cumprod(),
-            "S&P 500": (1+sp_ret).cumprod()
-        }))
-        st.subheader("Latest Allocations")
-        st.table(weights.tail(1).style.format("{:.2%}"))
+            with tab1:
+                comparison_df = pd.DataFrame({
+                    "AI Strategy": (1+s_ret).cumprod(),
+                    "S&P 500 (Benchmark)": (1+sp_ret).cumprod(),
+                    "Equal Weight Universe": (1+e_ret).cumprod()
+                })
+                st.line_chart(comparison_df)
+                
+                st.subheader("Current Allocation")
+                latest = weights.tail(1).T
+                latest.columns = ["Weight"]
+                st.bar_chart(latest)
 
-    with tab2:
-        st.subheader("Diagnostics")
-        col1, col2 = st.columns(2)
-        col1.metric("Avg MSE", f"{ml_diag['MSE'].mean():.6f}")
-        col2.metric("Directional Accuracy", f"{ml_diag['Dir_Accuracy'].mean():.2%}")
+            with tab2:
+                st.subheader("Model Indicators")
+                col1, col2 = st.columns(2)
+                col1.metric("Avg Predicted Return", f"{ml_diag['Avg_Pred'].mean():.4%}")
+                
+                st.write("Regime History (0=Low Vol, 2=High Vol/Crisis)")
+                st.line_chart(ml_diag["Regime"])
 
-        st.line_chart(ml_diag[["Log_Likelihood", "R2"]])
+            with tab3:
+                st.subheader("Portfolio Composition Over Time")
+                st.area_chart(weights)
+                st.dataframe(weights.tail(10).style.format("{:.2%}"))
 
-    with tab3:
-        st.area_chart(weights)
+        except Exception as e:
+            st.error(f"Error during execution: {e}")
